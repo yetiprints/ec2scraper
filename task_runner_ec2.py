@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import requests
 from datetime import datetime
 
 logging.basicConfig(
@@ -325,6 +326,21 @@ python3 /home/ubuntu/simple_test.py "{country_code}" "{location_name}"
         except KeyboardInterrupt:
             logger.info("Stopped tailing logs")
 
+    def terminate_self(self):
+        """Terminate this controller instance"""
+        try:
+            # Get instance ID from metadata
+            instance_id = requests.get(
+                'http://169.254.169.254/latest/meta-data/instance-id',
+                timeout=2
+            ).text
+            
+            logger.info(f"All work complete. Terminating controller instance {instance_id}")
+            self.ec2.terminate_instances(InstanceIds=[instance_id])
+        except Exception as e:
+            logger.error(f"Failed to terminate controller: {str(e)}", exc_info=True)
+            sys.exit(1)
+
     def run_country(self, country_code):
         """Process all locations for a country"""
         try:
@@ -347,6 +363,7 @@ python3 /home/ubuntu/simple_test.py "{country_code}" "{location_name}"
                 logger.error(f"Failed to access EC2: {str(e)}", exc_info=True)
                 return
             
+            consecutive_complete_checks = 0
             while self.running:
                 try:
                     # Get current stats
@@ -358,8 +375,20 @@ python3 /home/ubuntu/simple_test.py "{country_code}" "{location_name}"
                     
                     # Check if all locations are complete
                     if stats['complete'] == stats['total']:
-                        logger.info(f"All locations in {country_code} have been processed!")
-                        break
+                        # Wait for a few cycles to ensure everything is really done
+                        consecutive_complete_checks += 1
+                        if consecutive_complete_checks >= 3:  # Wait for 3 consecutive checks
+                            logger.info(f"All locations in {country_code} have been processed!")
+                            # Double check no instances are running
+                            running_instances = self.get_running_instances()
+                            if not running_instances:
+                                self.terminate_self()
+                                break
+                            else:
+                                logger.info(f"Waiting for {len(running_instances)} instances to terminate")
+                                consecutive_complete_checks = 0  # Reset counter
+                    else:
+                        consecutive_complete_checks = 0  # Reset counter if not all complete
                     
                     # Get current running instances
                     running_instances = self.get_running_instances()
@@ -369,16 +398,17 @@ python3 /home/ubuntu/simple_test.py "{country_code}" "{location_name}"
                     if available_slots > 0:
                         # Get INACTIVE locations
                         inactive_locations = self.get_inactive_locations(country_code)
-                        logger.info(f"Found {len(inactive_locations)} inactive locations")
-                        
-                        # Launch new instances up to the limit
-                        for location in inactive_locations[:available_slots]:
-                            location_name = location['location_name']['S']
-                            try:
-                                instance_id = self.launch_instance(country_code, location_name)
-                                logger.info(f"Launched instance {instance_id} for {location_name}")
-                            except Exception as e:
-                                logger.error(f"Failed to launch instance for {location_name}: {str(e)}", exc_info=True)
+                        if inactive_locations:
+                            logger.info(f"Found {len(inactive_locations)} inactive locations")
+                            
+                            # Launch new instances up to the limit
+                            for location in inactive_locations[:available_slots]:
+                                location_name = location['location_name']['S']
+                                try:
+                                    instance_id = self.launch_instance(country_code, location_name)
+                                    logger.info(f"Launched instance {instance_id} for {location_name}")
+                                except Exception as e:
+                                    logger.error(f"Failed to launch instance for {location_name}: {str(e)}", exc_info=True)
                     
                     # Wait before next check
                     time.sleep(30)
