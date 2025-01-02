@@ -1,0 +1,69 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket",
+                "s3:CreateBucket",
+                "s3:ListAllMyBuckets",
+                "s3:HeadBucket"
+            ],
+            "Resource": [
+                "arn:aws:s3:::dental-scraper-code",
+                "arn:aws:s3:::dental-scraper-code/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListAllMyBuckets",
+                "s3:HeadBucket"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:Query",
+                "dynamodb:Scan",
+                "dynamodb:DescribeTable",
+                "dynamodb:CreateTable"
+            ],
+            "Resource": [
+                "arn:aws:dynamodb:eu-west-2:580191193050:table/dental_location_control",
+                "arn:aws:dynamodb:eu-west-2:580191193050:table/dental_practice_details"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:RunInstances",
+                "ec2:TerminateInstances",
+                "ec2:DescribeInstances",
+                "ec2:CreateTags",
+                "ec2:DescribeInstanceStatus",
+                "iam:PassRole"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogStreams"
+            ],
+            "Resource": [
+                "arn:aws:logs:eu-west-2:*:log-group:/aws/ec2/dental-scraper-controller:*",
+                "arn:aws:logs:eu-west-2:*:log-group:/aws/ec2/dental-scraper-controller:*:*"
+            ]
+        }
+    ]
+}

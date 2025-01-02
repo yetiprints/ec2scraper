@@ -3,6 +3,8 @@ import time
 import logging
 import json
 import os
+import signal
+import sys
 from datetime import datetime
 
 logging.basicConfig(
@@ -15,12 +17,86 @@ logger = logging.getLogger(__name__)
 class TaskRunner:
     def __init__(self):
         self.ec2 = boto3.client('ec2', region_name='eu-west-2')
+        self.dynamodb = boto3.client('dynamodb', region_name='eu-west-2')
         self.logs = boto3.client('logs', region_name='eu-west-2')
+        self.running = True
         self.CONFIG = {
             'security_group_id': 'sg-0baac2c985b88fd23',
             'subnet_id': 'subnet-0d00b3a1ba2dd811b',
-            'log_group': '/aws/ec2/selenium-scraper'
+            'log_group': '/aws/ec2/selenium-scraper',
+            'max_instances': 2  # Maximum number of concurrent instances
         }
+        
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self.handle_shutdown)
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
+
+    def handle_shutdown(self, signum, frame):
+        """Handle shutdown signals"""
+        logger.info("Received shutdown signal. Cleaning up...")
+        self.running = False
+
+    def get_running_instances(self):
+        """Get currently running scraper instances"""
+        response = self.ec2.describe_instances(
+            Filters=[
+                {'Name': 'instance-state-name', 'Values': ['pending', 'running']},
+                {'Name': 'tag:Purpose', 'Values': ['dental-scraper']}
+            ]
+        )
+        
+        instances = []
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                instances.append(instance)
+        
+        return instances
+
+    def get_inactive_locations(self, country_code):
+        """Get INACTIVE locations for a specific country"""
+        response = self.dynamodb.query(
+            TableName='dental_location_control',
+            KeyConditionExpression='country_code = :cc',
+            FilterExpression='#status = :status',
+            ExpressionAttributeNames={'#status': 'status'},
+            ExpressionAttributeValues={
+                ':cc': {'S': country_code},
+                ':status': {'S': 'INACTIVE'}
+            }
+        )
+        return response.get('Items', [])
+
+    def get_location_stats(self, country_code):
+        """Get statistics for locations in a country"""
+        response = self.dynamodb.query(
+            TableName='dental_location_control',
+            KeyConditionExpression='country_code = :cc',
+            ExpressionAttributeValues={
+                ':cc': {'S': country_code}
+            }
+        )
+        
+        stats = {
+            'total': 0,
+            'inactive': 0,
+            'in_progress': 0,
+            'complete': 0,
+            'stopped': 0
+        }
+        
+        for item in response.get('Items', []):
+            stats['total'] += 1
+            status = item.get('status', {}).get('S', '').upper()
+            if status == 'INACTIVE':
+                stats['inactive'] += 1
+            elif status == 'IN_PROGRESS':
+                stats['in_progress'] += 1
+            elif status == 'COMPLETE':
+                stats['complete'] += 1
+            elif status == 'STOPPED':
+                stats['stopped'] += 1
+        
+        return stats
 
     def get_cloudwatch_config(self):
         """Get CloudWatch agent configuration"""
@@ -53,7 +129,7 @@ class TaskRunner:
         }
         return json.dumps(config)
 
-    def get_user_data(self):
+    def get_user_data(self, country_code, location_name):
         """Get user data script with proper escaping"""
         try:
             with open('simple_test.py', 'r') as f:
@@ -74,9 +150,9 @@ apt-get update
 apt-get install -y wget unzip python3-pip curl
 
 # Install system dependencies for Chrome
-apt-get install -y fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
-    libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1 libgdk-pixbuf2.0-0 libgtk-3-0 libnspr4 \
-    libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 \
+apt-get install -y fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \\
+    libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1 libgdk-pixbuf2.0-0 libgtk-3-0 libnspr4 \\
+    libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 \\
     libxrandr2 xdg-utils libu2f-udev libvulkan1 libxkbcommon0 libxss1
 
 # Install AWS CLI
@@ -101,64 +177,59 @@ cat > /opt/aws/amazon-cloudwatch-agent/bin/config.json << 'EOF'
 EOF
 
 # Start CloudWatch agent
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting CloudWatch agent..."
 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
 systemctl start amazon-cloudwatch-agent
 
-# Create chrome user and directories
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating chrome user and directories..."
-useradd -m -d /home/chrome -s /bin/bash chrome
-mkdir -p /home/chrome /tmp/chrome-data /opt/chrome /opt/chrome-driver
-chown -R chrome:chrome /home/chrome /tmp/chrome-data /opt/chrome /opt/chrome-driver
-
-# Create log files with proper permissions
-touch /tmp/chromedriver.log
-chown chrome:chrome /tmp/chromedriver.log
-chmod 644 /tmp/chromedriver.log
-
-# Install Chrome for Testing
+# Install Chrome
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Installing Chrome..."
-cd /opt/chrome
-wget https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/131.0.6778.108/linux64/chrome-linux64.zip
-unzip chrome-linux64.zip
-rm chrome-linux64.zip
-chown -R chrome:chrome /opt/chrome
+wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+dpkg -i google-chrome-stable_current_amd64.deb
+apt-get -f install -y
 
-# Install ChromeDriver
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Installing ChromeDriver..."
-cd /opt/chrome-driver
-wget https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/131.0.6778.108/linux64/chromedriver-linux64.zip
-unzip chromedriver-linux64.zip
-rm chromedriver-linux64.zip
-chown -R chrome:chrome /opt/chrome-driver
+# Install Python dependencies
+pip3 install selenium==4.15.2 boto3 requests
 
-# Add to PATH for all users
-echo 'export PATH=$PATH:/opt/chrome/chrome-linux64:/opt/chrome-driver/chromedriver-linux64' >> /etc/environment
-source /etc/environment
-
-# Install Python packages
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Installing Python packages..."
-pip install selenium==4.15.2
-
-# Copy test script
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Setting up test script..."
-cat > /home/chrome/test.py << 'INNEREOF'
+# Create and run test script
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating test script..."
+cat > /home/ubuntu/simple_test.py << 'EOF'
 {test_code}
-INNEREOF
+EOF
 
-# Set permissions
-chown -R chrome:chrome /home/chrome/test.py
-chmod +x /home/chrome/test.py
-
-# Run test as chrome user with proper environment
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting test..."
-sudo -u chrome bash -c "source /etc/environment && python3 /home/chrome/test.py"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Test finished!"
+# Run the test
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running test..."
+python3 /home/ubuntu/simple_test.py "{country_code}" "{location_name}"
 '''
         except Exception as e:
-            logger.error(f"Failed to generate user data: {str(e)}", exc_info=True)
+            logger.error(f"Failed to generate user data: {str(e)}")
             raise
+
+    def update_location_status(self, country_code, location_name, status, error_message=None):
+        """Update location status in DynamoDB"""
+        try:
+            update_expr = "SET #status = :status, last_updated = :timestamp"
+            expr_attrs = {
+                ':status': {'S': status},
+                ':timestamp': {'S': datetime.utcnow().isoformat()}
+            }
+            expr_names = {'#status': 'status'}
+            
+            if error_message:
+                update_expr += ", error_message = :error"
+                expr_attrs[':error'] = {'S': error_message}
+            
+            self.dynamodb.update_item(
+                TableName='dental_location_control',
+                Key={
+                    'country_code': {'S': country_code},
+                    'location_name': {'S': location_name}
+                },
+                UpdateExpression=update_expr,
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_attrs
+            )
+            logger.info(f"Updated location {country_code}:{location_name} status to {status}")
+        except Exception as e:
+            logger.error(f"Failed to update DynamoDB: {str(e)}")
 
     def ensure_log_group_exists(self):
         """Ensure CloudWatch log group exists"""
@@ -168,14 +239,14 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Test finished!"
         except self.logs.exceptions.ResourceAlreadyExistsException:
             logger.info(f"Log group already exists: {self.CONFIG['log_group']}")
 
-    def launch_instance(self):
+    def launch_instance(self, country_code, location_name):
         """Launch EC2 instance with Chrome"""
         try:
-            # Get user data script
-            user_data = self.get_user_data()
+            # First update status to IN_PROGRESS
+            self.update_location_status(country_code, location_name, 'IN_PROGRESS')
             
-            # Request spot instance
-            spot_price = '0.0416'  # Max price for t3.medium spot instance
+            # Ensure log group exists
+            self.ensure_log_group_exists()
             
             # Launch spot instance
             response = self.ec2.run_instances(
@@ -183,49 +254,35 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Test finished!"
                 InstanceType='t3.medium',
                 MinCount=1,
                 MaxCount=1,
+                SecurityGroupIds=[self.CONFIG['security_group_id']],
+                SubnetId=self.CONFIG['subnet_id'],
+                IamInstanceProfile={'Name': 'venue-scraper-profile'},
                 InstanceMarketOptions={
                     'MarketType': 'spot',
                     'SpotOptions': {
-                        'MaxPrice': spot_price,
+                        'MaxPrice': '0.04',
                         'SpotInstanceType': 'one-time'
                     }
                 },
-                UserData=user_data,
-                IamInstanceProfile={'Name': 'venue-scraper-profile'},
-                SecurityGroups=['default'],
-                TagSpecifications=[
-                    {
-                        'ResourceType': 'instance',
-                        'Tags': [
-                            {
-                                'Key': 'Name',
-                                'Value': 'selenium-scraper'
-                            }
-                        ]
-                    }
-                ]
+                UserData=self.get_user_data(country_code, location_name),
+                TagSpecifications=[{
+                    'ResourceType': 'instance',
+                    'Tags': [
+                        {'Key': 'Name', 'Value': f'dental-scraper-{location_name}'},
+                        {'Key': 'Purpose', 'Value': 'dental-scraper'},
+                        {'Key': 'Location', 'Value': f'{country_code}#{location_name}'}
+                    ]
+                }]
             )
             
             instance_id = response['Instances'][0]['InstanceId']
             logger.info(f"Launched instance {instance_id}")
-            
-            # Wait for instance to be running
-            logger.info("Waiting for instance to be running...")
-            waiter = self.ec2.get_waiter('instance_running')
-            waiter.wait(InstanceIds=[instance_id])
-            
-            # Get instance public IP
-            instance = self.ec2.describe_instances(InstanceIds=[instance_id])['Reservations'][0]['Instances'][0]
-            public_ip = instance['PublicIpAddress']
-            logger.info(f"Instance {instance_id} is running at {public_ip}")
-            
-            # Log CloudWatch URL
-            logger.info(f"View logs at: https://eu-west-2.console.aws.amazon.com/cloudwatch/home?region=eu-west-2#logsV2:log-groups/log-group//aws/ec2/selenium-scraper")
-            
             return instance_id
             
         except Exception as e:
-            logger.error(f"Failed to launch instance: {str(e)}", exc_info=True)
+            # If launch fails, set status back to INACTIVE
+            self.update_location_status(country_code, location_name, 'INACTIVE', str(e))
+            logger.error(f"Failed to launch instance: {str(e)}")
             raise
 
     def wait_for_instance(self, instance_id):
@@ -268,26 +325,81 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Test finished!"
         except KeyboardInterrupt:
             logger.info("Stopped tailing logs")
 
-    def run(self):
+    def run_country(self, country_code):
+        """Process all locations for a country"""
         try:
-            # Ensure log group exists
-            self.ensure_log_group_exists()
+            logger.info(f"Starting dental practice scraper for country: {country_code}")
+            logger.info("Testing AWS permissions...")
             
-            # Launch instance
-            instance_id = self.launch_instance()
-            if not instance_id:
+            # Test DynamoDB access
+            try:
+                stats = self.get_location_stats(country_code)
+                logger.info(f"Successfully accessed DynamoDB. Found {stats['total']} locations")
+            except Exception as e:
+                logger.error(f"Failed to access DynamoDB: {str(e)}", exc_info=True)
                 return
             
-            ip_address = self.wait_for_instance(instance_id)
-            logger.info(f"Instance {instance_id} is running at {ip_address}")
-            logger.info(f"View logs at: https://eu-west-2.console.aws.amazon.com/cloudwatch/home?region=eu-west-2#logsV2:log-groups/log-group/{self.CONFIG['log_group']}")
+            # Test EC2 access
+            try:
+                instances = self.get_running_instances()
+                logger.info(f"Successfully accessed EC2. Found {len(instances)} running instances")
+            except Exception as e:
+                logger.error(f"Failed to access EC2: {str(e)}", exc_info=True)
+                return
             
-            # Stream logs
-            self.tail_cloudwatch_logs(instance_id)
+            while self.running:
+                try:
+                    # Get current stats
+                    stats = self.get_location_stats(country_code)
+                    logger.info(f"Country {country_code} progress: "
+                            f"{stats['complete']}/{stats['total']} complete, "
+                            f"{stats['in_progress']} in progress, "
+                            f"{stats['stopped']} stopped")
+                    
+                    # Check if all locations are complete
+                    if stats['complete'] == stats['total']:
+                        logger.info(f"All locations in {country_code} have been processed!")
+                        break
+                    
+                    # Get current running instances
+                    running_instances = self.get_running_instances()
+                    available_slots = self.CONFIG['max_instances'] - len(running_instances)
+                    logger.info(f"Running instances: {len(running_instances)}, Available slots: {available_slots}")
+                    
+                    if available_slots > 0:
+                        # Get INACTIVE locations
+                        inactive_locations = self.get_inactive_locations(country_code)
+                        logger.info(f"Found {len(inactive_locations)} inactive locations")
+                        
+                        # Launch new instances up to the limit
+                        for location in inactive_locations[:available_slots]:
+                            location_name = location['location_name']['S']
+                            try:
+                                instance_id = self.launch_instance(country_code, location_name)
+                                logger.info(f"Launched instance {instance_id} for {location_name}")
+                            except Exception as e:
+                                logger.error(f"Failed to launch instance for {location_name}: {str(e)}", exc_info=True)
+                    
+                    # Wait before next check
+                    time.sleep(30)
+                    
+                except Exception as e:
+                    logger.error(f"Error in control loop: {str(e)}", exc_info=True)
+                    if not self.running:
+                        break
+                    time.sleep(30)
             
         except Exception as e:
-            logger.error(f"Error: {str(e)}", exc_info=True)
+            logger.error(f"Fatal error in run_country: {str(e)}", exc_info=True)
+        
+        logger.info(f"Finished processing country: {country_code}")
 
 if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 task_runner_ec2.py <country_code>")
+        print("Example: python3 task_runner_ec2.py UK")
+        sys.exit(1)
+    
+    country_code = sys.argv[1].upper()
     runner = TaskRunner()
-    runner.run()
+    runner.run_country(country_code)
